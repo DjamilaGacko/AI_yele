@@ -63,6 +63,30 @@ PII_PROJECTION = {
     "extra_raw": 0, "user_agent": 0, "language": 0,
 }
 
+# Fusion des libellés d'opérateur en doublon (mêmes règles que prepare_data.py).
+# Sans cela, "ONATEL (…" et "ONATEL (…, PTT)" sont traités comme deux opérateurs.
+OPERATOR_ALIASES = [
+    ("onatel", "ONATEL / Telmob"),
+    ("office national des telecommunications", "ONATEL / Telmob"),
+    ("orange burkina", "Orange Burkina Faso"),
+    ("anptic", "ANPTIC"),
+    ("agence nationale de promotion des tic", "ANPTIC"),
+    ("autorite de regulation des communications", "ARCEP Burkina"),
+    ("telecel", "Telecel Faso"),
+    ("moov", "Moov Africa"),
+]
+
+
+def _canon_operator(name: str) -> str:
+    """Ramène chaque variante d'écriture au libellé canonique."""
+    if not isinstance(name, str) or not name:
+        return name
+    low = name.lower()
+    for motif, canonique in OPERATOR_ALIASES:
+        if motif in low:
+            return canonique
+    return name.strip()
+
 
 def load_dataframe() -> pd.DataFrame:
     """Extraction MongoDB (sans PII) + nettoyage, comme prepare_data.py."""
@@ -79,13 +103,16 @@ def load_dataframe() -> pd.DataFrame:
         df[col] = pd.to_numeric(df.get(col), errors="coerce")
     df["timestamp"] = pd.to_datetime(df.get("timestamp"), errors="coerce", utc=True)
     df = df.dropna(subset=["timestamp", "dl"])
-    df = df[(df["dl"] >= 0) & (df["dl"] < 2000)]
+    # Débit 0 = speedtest absent/échoué (souvent une session streaming seule) : exclu.
+    df = df[(df["dl"] > 0) & (df["dl"] < 2000)]
 
     df["hour"] = df["timestamp"].dt.hour
     df["dayofweek"] = df["timestamp"].dt.dayofweek
     df["is_weekend"] = (df["dayofweek"] >= 5).astype(int)
     for col in ["operator", "network_type"]:
         df[col] = df.get(col, "").fillna("Inconnu").replace("", "Inconnu")
+    # Fusion des opérateurs en doublon (ONATEL ×2, ANPTIC/ARCEP en toutes lettres…).
+    df["operator"] = df["operator"].map(_canon_operator)
     return df.reset_index(drop=True)
 
 
