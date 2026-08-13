@@ -1,0 +1,18 @@
+# Extraction + prétraitement + exploration
+pymongo>=4.6
+pandas>=2.0
+python-dotenv>=1.0
+
+# Modèles (anomalies + prédiction)
+scikit-learn>=1.4
+numpy>=1.26
+pyod>=1.1          # ECOD : détection d'anomalies explicable
+# tabpfn>=2.2      # prédiction (petit jeu) ; installé à part si dispo
+
+# Service web
+fastapi>=0.110
+uvicorn>=0.29
+
+# Exploration locale (facultatif en production)
+matplotlib>=3.7
+jupyterlab>=4.0

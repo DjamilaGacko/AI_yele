@@ -1,0 +1,11 @@
+# Dépendances du micro-service IA en production (image Docker légère).
+# Volontairement sans matplotlib / jupyterlab (exploration locale uniquement)
+# ni tabpfn (ne peut pas tourner sans interface → repli Gradient Boosting).
+pymongo>=4.6
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+pyod>=1.1          # ECOD : détection d'anomalies explicable
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0

@@ -1,0 +1,20 @@
+# Secrets — ne jamais committer la chaîne de connexion
+.env
+
+# Données exportées / nettoyées (peuvent contenir des données sensibles)
+raw.json
+dataset_clean.csv
+*.csv
+*.json
+
+# Modèles entraînés
+*.joblib
+
+# Python / Jupyter
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Donnees externes volumineuses (jamais sur GitHub)
+dataset/
