@@ -18,3 +18,9 @@ venv/
 
 # Donnees externes volumineuses (jamais sur GitHub)
 dataset/
+
+# Espaces de travail et reglages d IDE (specifiques a chaque machine).
+# Le workspace multi-depots de Yele vit AU-DESSUS des depots, jamais dedans.
+*.code-workspace
+.vscode/
+.idea/
