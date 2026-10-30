@@ -1,0 +1,10 @@
+# Mêmes modèles que l'image Render : LOF (pyod) et Gradient Boosting
+# (scikit-learn), sans TabPFN ni PyTorch.
+pymongo>=4.6
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+pyod>=1.1
+fastapi>=0.110
+uvicorn>=0.29
+python-dotenv>=1.0

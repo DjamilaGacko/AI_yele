@@ -1,11 +1,16 @@
 """Modèles IA Yélé : détection d'anomalies + prédiction de qualité.
 
 Trois niveaux complémentaires :
- 1. Statistique (IQR par opérateur)      -> marche dès ~30 mesures
- 2. Isolation Forest multivarié          -> anomalies de combinaison (dl/ping/…)
- 3. Régression (gradient boosting)       -> qualité attendue par contexte ;
+ 1. Statistique (percentile 5 par opérateur) -> marche dès ~30 mesures
+ 2. LOF multivarié                           -> anomalies de combinaison (dl/ping/…)
+ 3. Régression (Gradient Boosting)           -> qualité attendue par contexte ;
     l'écart mesuré-prédit (résidu) donne l'anomalie *contextuelle*
     et le modèle sert aussi à la prévision (forecast).
+
+LOF et Gradient Boosting sont les modèles de production, retenus après
+comparaison avec ECOD, COPOD, Isolation Forest et TabPFN (notebook 04).
+Isolation Forest ne sert que de repli si PyOD manque à l'environnement ;
+/ai/health indique toujours les modèles effectivement chargés.
 """
 
 import os
@@ -15,47 +20,41 @@ import numpy as np
 import pandas as pd
 from pymongo import MongoClient
 from sklearn.ensemble import HistGradientBoostingRegressor, IsolationForest
-
-# TabPFN : modèle de fondation tabulaire, déjà pré-entraîné, pensé pour les
-# PETITS jeux de données (< 1000 lignes) — donc idéal ici. On le préfère au
-# gradient boosting quand il est installé ; sinon on retombe sur sklearn.
-try:
-    from tabpfn import TabPFNRegressor
-    _HAS_TABPFN = True
-except ImportError:
-    _HAS_TABPFN = False
+from sklearn.preprocessing import StandardScaler
 
 
 def _make_regressor():
-    """Régresseur de prédiction du débit : TabPFN si dispo, sinon sklearn."""
-    if _HAS_TABPFN:
-        # ignore_pretraining_limits : autorise nos features même si le contexte
-        # est petit ; TabPFN reste déterministe (pas de random_state requis).
-        return TabPFNRegressor(ignore_pretraining_limits=True)
-    return HistGradientBoostingRegressor(random_state=42)
+    """Régresseur de prédiction du débit + son nom.
+
+    Gradient Boosting a battu TabPFN sur 4 découpages chronologiques sur 5,
+    s'entraîne en moins d'une seconde et ne dépend pas de PyTorch.
+    """
+    return HistGradientBoostingRegressor(random_state=42), "Gradient Boosting"
 
 
-# ECOD : détecteur d'anomalies sans paramètre, déterministe et EXPLICABLE
-# (il dit quelle variable rend une mesure anormale). Préféré à Isolation Forest
-# quand PyOD est installé ; sinon on retombe sur Isolation Forest.
+# LOF : compare chaque mesure à ses voisines les plus proches, sur les quatre
+# KPI à la fois. Il repère les combinaisons anormales (débit effondré avec un
+# débit montant normal…) que les détecteurs variable par variable (ECOD, COPOD)
+# ratent. Isolation Forest sert de repli si PyOD est absent.
 try:
-    from pyod.models.ecod import ECOD
-    _HAS_ECOD = True
+    from pyod.models.lof import LOF
+    _HAS_PYOD = True
 except ImportError:
-    _HAS_ECOD = False
+    _HAS_PYOD = False
 
 
 def _make_detector():
-    """Détecteur d'anomalies + son nom : ECOD si dispo, sinon Isolation Forest."""
-    if _HAS_ECOD:
-        return ECOD(contamination=CONTAMINATION), "ECOD"
+    """Détecteur d'anomalies + son nom : LOF si dispo, sinon Isolation Forest."""
+    if _HAS_PYOD:
+        return LOF(contamination=CONTAMINATION, n_neighbors=LOF_NEIGHBORS), "LOF"
     return IsolationForest(n_estimators=200, contamination=CONTAMINATION,
                            random_state=42), "Isolation Forest"
 
 KPI = ["dl", "ul", "ping", "jitter"]
 FEATURES = ["hour", "dayofweek", "is_weekend", "op_code", "net_code"]
 MIN_SAMPLES_ML = 50          # en dessous : méthodes statistiques uniquement
-CONTAMINATION = 0.03         # part d'anomalies attendue (Isolation Forest)
+CONTAMINATION = 0.03         # part d'anomalies attendue (détecteur multivarié)
+LOF_NEIGHBORS = 15           # résultat stable entre 10 et 20 voisins
 
 # Champs personnels : jamais extraits.
 PII_PROJECTION = {
@@ -105,6 +104,8 @@ def load_dataframe() -> pd.DataFrame:
     df = df.dropna(subset=["timestamp", "dl"])
     # Débit 0 = speedtest absent/échoué (souvent une session streaming seule) : exclu.
     df = df[(df["dl"] > 0) & (df["dl"] < 2000)]
+    # Latence impossible (> 5 s) : même exclusion que prepare_data.py.
+    df = df[df["ping"].isna() | ((df["ping"] >= 0) & (df["ping"] < 5000))]
 
     df["hour"] = df["timestamp"].dt.hour
     df["dayofweek"] = df["timestamp"].dt.dayofweek
@@ -125,12 +126,14 @@ class YeleAI:
         self.operators: list[str] = []
         self.networks: list[str] = []
         self.group_stats: dict = {}
-        self.detector = None            # ECOD ou Isolation Forest
+        self.detector = None            # LOF ou Isolation Forest
         self.detector_name = ""
+        self.scaler = None              # mise à l'échelle des KPI (après log)
         self.det_threshold = 0.0        # seuil de score au-dessus duquel = anomalie
         self.det_scoremax = 1.0         # score max observé (pour normaliser la sévérité)
         self.kpi_train = None           # valeurs KPI d'entraînement (CDF empirique)
-        self.reg: HistGradientBoostingRegressor | None = None
+        self.reg = None                 # Gradient Boosting
+        self.reg_name = ""
         self.resid_std = 0.0
 
     # ── Entraînement ─────────────────────────────────────────────────────────
@@ -161,11 +164,14 @@ class YeleAI:
         if len(df) < MIN_SAMPLES_ML:
             return  # trop peu de données pour le ML : stats uniquement
 
-        # 2) Détecteur multivarié sur les KPI (ECOD, sinon Isolation Forest)
+        # 2) Détecteur multivarié sur les KPI (LOF, sinon Isolation Forest).
+        # Log puis mise à l'échelle : sans cela, la latence (en milliers de ms)
+        # écrase les débits dans les distances de LOF.
         x_kpi = df[KPI].fillna(df[KPI].median())
+        self.scaler = StandardScaler().fit(np.log1p(x_kpi.clip(lower=0)))
         self.detector, self.detector_name = _make_detector()
-        self.detector.fit(x_kpi)
-        self.kpi_train = x_kpi.to_numpy()               # pour l'explicabilité ECOD
+        self.detector.fit(self._scale(x_kpi))
+        self.kpi_train = x_kpi.to_numpy()               # pour expliquer les alertes
         train_scores = self._detector_scores(x_kpi)     # scores d'anomalie
         # Seuil = quantile (1 - contamination) ; sert aussi à normaliser la sévérité.
         self.det_threshold = float(np.quantile(train_scores, 1 - CONTAMINATION))
@@ -174,7 +180,8 @@ class YeleAI:
         # 3) Régression : débit attendu selon le contexte
         x = self._features(df)
         y = df["dl"]
-        self.reg = _make_regressor().fit(x, y)
+        self.reg, self.reg_name = _make_regressor()
+        self.reg.fit(x, y)
         resid = y - self.reg.predict(x)
         self.resid_std = float(max(resid.std(), 1e-6))
         self.ml_ready = True
@@ -188,18 +195,24 @@ class YeleAI:
             df["hour"], df["dayofweek"], df["is_weekend"], op, net,
         ]).astype(float)
 
+    def _scale(self, x_kpi: pd.DataFrame) -> np.ndarray:
+        """KPI passés au log puis mis à l'échelle de l'entraînement."""
+        return self.scaler.transform(np.log1p(x_kpi.clip(lower=0)))
+
     def _detector_scores(self, x_kpi: pd.DataFrame) -> np.ndarray:
         """Score d'anomalie unifié (grand = anormal), quel que soit le détecteur."""
+        x = self._scale(x_kpi)
         if self.detector_name == "Isolation Forest":
-            return -self.detector.decision_function(x_kpi)  # sklearn : grand = normal
-        return self.detector.decision_function(x_kpi)       # ECOD/PyOD : grand = anormal
+            return -self.detector.decision_function(x)  # sklearn : grand = normal
+        return self.detector.decision_function(x)       # LOF/PyOD : grand = anormal
 
     def _kpi_contributions(self, values: np.ndarray) -> np.ndarray:
-        """Part de chaque KPI dans l'anomalie (façon ECOD : queues empiriques).
+        """Part de chaque KPI dans l'anomalie (queues empiriques).
 
-        Pour chaque variable, on mesure à quel point la valeur est extrême dans
+        LOF dit qu'une mesure est anormale, pas pourquoi. On le complète ici :
+        pour chaque variable, on mesure à quel point la valeur est extrême dans
         la distribution d'entraînement (queue basse OU haute), en -log(proba).
-        Sert à dire « c'est le ping qui est aberrant » — l'atout d'ECOD.
+        Sert à dire « c'est le ping qui est aberrant ».
         """
         n = len(self.kpi_train)
         contrib = np.zeros(len(KPI))
@@ -250,21 +263,16 @@ class YeleAI:
                 if scores[i] >= self.det_threshold:
                     norm = min(max((scores[i] - self.det_threshold) / span, 0), 1)
                     severity[i] += 30 + 30 * norm
-                    # Explicabilité ECOD : la ou les variables qui dominent.
-                    if self.detector_name == "ECOD" and self.kpi_train is not None:
-                        c = self._kpi_contributions(x_vals[i])
-                        total = c.sum()
-                        if total > 0:
-                            top = c.argsort()[::-1]
-                            parts = [f"{KPI[j]} {100 * c[j] / total:.0f} %"
-                                     for j in top[:2] if c[j] / total >= 0.15]
-                            reasons[i].append(
-                                "Combinaison atypique (ECOD) — dominé par "
-                                + ", ".join(parts) if parts else
-                                "Combinaison de mesures atypique (ECOD)")
-                    else:
-                        reasons[i].append(
-                            f"Combinaison de mesures atypique ({self.detector_name})")
+                    # Explication : la ou les variables qui dominent.
+                    c = self._kpi_contributions(x_vals[i])
+                    total = c.sum()
+                    top = c.argsort()[::-1]
+                    parts = [f"{KPI[j]} {100 * c[j] / total:.0f} %"
+                             for j in top[:2] if total > 0 and c[j] / total >= 0.15]
+                    reasons[i].append(
+                        f"Combinaison atypique ({self.detector_name}) — dominé par "
+                        + ", ".join(parts) if parts else
+                        f"Combinaison de mesures atypique ({self.detector_name})")
 
         # Niveau 3 : anomalie contextuelle (écart au débit prédit)
         if self.ml_ready:

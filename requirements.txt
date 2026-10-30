@@ -6,8 +6,8 @@ python-dotenv>=1.0
 # Modèles (anomalies + prédiction)
 scikit-learn>=1.4
 numpy>=1.26
-pyod>=1.1          # ECOD : détection d'anomalies explicable
-# tabpfn>=2.2      # prédiction (petit jeu) ; installé à part si dispo
+pyod>=1.1          # LOF (retenu), ECOD, COPOD : détection d'anomalies
+tabpfn==2.2.1      # comparaison avec Gradient Boosting (notebook 04) ; absent de la production
 
 # Service web
 fastapi>=0.110

@@ -339,7 +339,8 @@ def lire_annotation() -> None:
 # ══════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    df = pd.read_csv(DATASET, parse_dates=["timestamp"])
+    df = pd.read_csv(DATASET)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="mixed")
     _titre("ÉVALUATION DES MODÈLES IA YÉLÉ")
     print(f"  Dataset  : {len(df)} mesures")
     print(f"  Période  : {df['timestamp'].min():%d/%m/%Y} -> "

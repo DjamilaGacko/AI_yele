@@ -5,13 +5,14 @@
 FROM python:3.12-slim
 
 WORKDIR /app
+
 COPY requirements-service.txt .
 RUN pip install --no-cache-dir -r requirements-service.txt
 
 COPY model.py service.py ./
 
-# La détection tourne avec ECOD (pyod) ; la prédiction retombe sur
-# Gradient Boosting (TabPFN nécessite une interface, indisponible ici).
+# Détection : LOF (pyod) ; prédiction : Gradient Boosting (scikit-learn).
+# Ni PyTorch ni poids à télécharger : l'image reste légère.
 ENV PYTHONUNBUFFERED=1
 
 # Render fournit $PORT ; 8000 par défaut en local.

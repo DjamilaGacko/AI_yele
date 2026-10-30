@@ -93,7 +93,7 @@ Deux fichiers de dépendances, volontairement distincts :
 
 | Route | Renvoie |
 |---|---|
-| `GET /ai/health` | État du service, volume de données, opérateurs connus |
+| `GET /ai/health` | État du service, volume de données, opérateurs connus, modèles chargés (`detector`, `regressor`) |
 | `GET /ai/anomalies?days=30&limit=100` | Anomalies détectées, avec sévérité et explications |
 | `GET /ai/forecast?operator=X&hours=48` | Débit descendant prédit, heure par heure |
 | `POST /ai/retrain` | Ré-entraîne les modèles sur les données actuelles |
@@ -134,12 +134,14 @@ comparaison_approches.py    Comparaison des approches essayées
 01_nettoyage.ipynb          Notebook : nettoyage pas à pas
 02_entrainement.ipynb       Notebook : entraînement et résultats
 03_detection_pyod.ipynb     Notebook : détection d'anomalies
+04_reevaluation.ipynb       Notebook : réévaluation complète (chapitre 5 du rapport)
 explore.ipynb               Notebook : exploration initiale
+hf_space/                   Copie du service pour une Space Hugging Face (secours)
 ```
 
 Ordre de lecture conseillé pour comprendre la démarche :
 `explore.ipynb` → `01_nettoyage.ipynb` → `02_entrainement.ipynb` →
-`03_detection_pyod.ipynb`, puis `model.py`.
+`03_detection_pyod.ipynb` → `04_reevaluation.ipynb`, puis `model.py`.
 
 ### Ce qui n'est pas versionné
 
@@ -148,7 +150,7 @@ Le `.gitignore` exclut délibérément :
 - `.env` — secrets ;
 - `*.csv`, `*.json` — données extraites, susceptibles de contenir des
   informations sensibles ;
-- `*.joblib` — modèles entraînés (le fichier fait environ 44 Mo) ;
+- `*.joblib` — modèles entraînés ;
 - `dataset/` — données externes volumineuses.
 
 Un dépôt fraîchement cloné ne contient donc **ni données ni modèle** : il faut
@@ -165,8 +167,8 @@ Le module répond à deux questions distinctes, qu'il ne faut pas confondre :
 | | Détection d'anomalies | Prévision du débit |
 |---|---|---|
 | Nature | Classification non supervisée | Régression |
-| Modèle retenu | **ECOD** (PyOD) | **Gradient Boosting** (scikit-learn) |
-| Comparé à | Isolation Forest, COPOD, LOF | TabPFN |
+| Modèle retenu | **LOF** (PyOD) | **Gradient Boosting** (scikit-learn) |
+| Comparé à | Isolation Forest, ECOD, COPOD | TabPFN (modèle de fondation tabulaire) |
 | Métriques | Taux de détection, cohérence | MAE, RMSE, R², *skill score* |
 
 Il n'existe ni F1 ni AUC pour une régression : ces métriques mesurent une
@@ -174,7 +176,17 @@ classification. L'équivalent du « bon / pas bon » pour la prévision est le
 *skill score*, qui compare le modèle à une référence naïve.
 
 Le script `comparaison_approches.py` présente ces comparaisons côte à côte et
-documente les choix retenus.
+documente les choix retenus :
+
+- **LOF** juge les quatre KPI ensemble et repère les combinaisons anormales
+  (débit effondré avec un débit montant normal…) que ECOD et COPOD, qui jugent
+  chaque variable séparément, ratent. Les KPI sont passés au **log puis mis à
+  l'échelle** avant LOF : sans cela, la latence (en milliers de ms) écrase les
+  débits dans le calcul des distances.
+- LOF ne dit pas quelle variable est en cause : le service le calcule à part
+  (`_kpi_contributions`), d'où les raisons « dominé par ping 35 %… ».
+- **Gradient Boosting** bat TabPFN sur 4 découpages chronologiques sur 5,
+  s'entraîne en moins d'une seconde et ne dépend pas de PyTorch.
 
 ### Dégradation progressive selon le volume de données
 
@@ -223,7 +235,7 @@ Cette règle doit être préservée : ne pas retirer de champ de `PII_PROJECTION
 ## Utilisation en recherche
 
 ```bash
-python prepare_data.py    # 1. Extraire et nettoyer -> dataset_clean.csv
+python prepare_data.py    # 1. Nettoyer l'export Compass (CSV) ou MongoDB -> dataset_clean.csv
 python train.py           # 2. Entraîner + rapport de qualité
 python evaluate.py        # 3. Évaluation détaillée
 python pyod_detectors.py  # 4. Comparer les détecteurs d'anomalies
@@ -243,8 +255,18 @@ docker run -p 8000:8000 \
 ```
 
 L'image de production n'embarque ni matplotlib, ni JupyterLab, ni TabPFN.
-TabPFN nécessite un environnement graphique indisponible en conteneur : la
-prévision retombe donc sur Gradient Boosting en production.
+Elle contient **LOF** (PyOD) et **Gradient Boosting** (scikit-learn), sans
+PyTorch ni poids à télécharger : elle reste légère et tient dans l'offre
+gratuite de Render.
+
+Isolation Forest reste dans le code comme **repli**, si PyOD venait à manquer.
+`/ai/health` indique toujours les modèles réellement chargés (`detector`,
+`regressor`) : le vérifier après chaque déploiement. Le service met ses
+réponses en cache jusqu'au ré-entraînement suivant.
+
+Le dossier `hf_space/` contient une copie du service pour une Space Hugging
+Face (SDK Gradio), gardée en secours. Après une modification de `model.py` ou
+de `service.py`, y recopier les deux fichiers.
 
 Une fois le service en ligne, renseigner son URL dans le backend Go via
 `SPEEDTEST_AI_SERVICE_URL`. Sans cette variable, les routes `/api/ai/*` ne sont

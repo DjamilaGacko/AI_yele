@@ -13,6 +13,7 @@ Lancement local :
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
@@ -24,6 +25,11 @@ load_dotenv()
 _state: dict = {"ai": None, "df": None, "trained_at": None, "error": None}
 _lock = threading.Lock()
 
+# Réponses calculées, valables jusqu'au prochain ré-entraînement : l'analyse de
+# toute la base n'est faite qu'une fois par question, même sur le CPU modeste
+# d'une offre gratuite.
+_cache: dict = {}
+
 
 def _retrain() -> None:
     try:
@@ -32,6 +38,7 @@ def _retrain() -> None:
         ai.train(df)
         with _lock:
             _state.update(ai=ai, df=df, trained_at=time.time(), error=None)
+            _cache.clear()
     except Exception as exc:  # service utilisable même si Mongo est down
         with _lock:
             _state["error"] = str(exc)
@@ -58,6 +65,8 @@ def health():
             "mlReady": ai.ml_ready if ai else False,
             "minSamplesForMl": MIN_SAMPLES_ML,
             "trainedAt": _state["trained_at"],
+            "detector": ai.detector_name if ai else "",
+            "regressor": ai.reg_name if ai else "",
             "operators": ai.operators if ai else [],
         }
 
@@ -69,13 +78,16 @@ def anomalies(limit: int = Query(50, ge=1, le=200),
         ai, df = _state["ai"], _state["df"]
     if ai is None or df is None or df.empty:
         return {"anomalies": [], "analyzed": 0, "mlReady": False}
-    cutoff = df["timestamp"].max() - __import__("pandas").Timedelta(days=days)
-    recent = df[df["timestamp"] >= cutoff]
-    return {
-        "anomalies": ai.detect(recent, limit=limit),
-        "analyzed": int(len(recent)),
-        "mlReady": ai.ml_ready,
-    }
+    key = ("anomalies", limit, days)
+    if key not in _cache:
+        cutoff = df["timestamp"].max() - __import__("pandas").Timedelta(days=days)
+        recent = df[df["timestamp"] >= cutoff]
+        _cache[key] = {
+            "anomalies": ai.detect(recent, limit=limit),
+            "analyzed": int(len(recent)),
+            "mlReady": ai.ml_ready,
+        }
+    return _cache[key]
 
 
 @app.get("/ai/forecast")
@@ -84,11 +96,18 @@ def forecast(operator: str, hours: int = Query(48, ge=1, le=168)):
         ai = _state["ai"]
     if ai is None:
         return {"forecast": [], "mlReady": False}
-    return {
-        "operator": operator,
-        "forecast": ai.forecast(operator, hours=hours),
-        "mlReady": ai.ml_ready,
-    }
+    # La prévision part de l'heure courante : la clé change à chaque heure.
+    hour = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    key = ("forecast", operator, hours, hour)
+    if key not in _cache:
+        for old in [k for k in _cache if k[0] == "forecast" and k[3] != hour]:
+            del _cache[old]
+        _cache[key] = {
+            "operator": operator,
+            "forecast": ai.forecast(operator, hours=hours),
+            "mlReady": ai.ml_ready,
+        }
+    return _cache[key]
 
 
 @app.post("/ai/retrain")

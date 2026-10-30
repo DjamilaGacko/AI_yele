@@ -1,19 +1,20 @@
-"""Option B — Comparaison de détecteurs d'anomalies (autonome).
+"""Comparaison de détecteurs d'anomalies (autonome).
 
-Compare, sur les mêmes données, plusieurs détecteurs NON supervisés pour
-remplacer éventuellement l'Isolation Forest utilisé dans model.py :
+Compare, sur les mêmes données, plusieurs détecteurs NON supervisés :
 
-  - Isolation Forest  (référence actuelle, scikit-learn)
+  - LOF               (PyOD, anomalies locales par voisinage) — retenu
+  - Isolation Forest  (scikit-learn, repli de model.py)
   - ECOD              (PyOD, sans paramètre)
   - COPOD             (PyOD, sans paramètre)
-  - LOF               (PyOD, anomalies locales par voisinage)
+
+Tous reçoivent la même préparation que dans model.py : KPI passés au log puis
+mis à l'échelle de l'entraînement.
 
 Méthode d'évaluation identique à evaluate.py : injection synthétique
 d'anomalies (on dégrade volontairement une partie du jeu de test, puis on
 mesure si chaque détecteur les retrouve — ROC-AUC, PR-AUC, F1).
 
-Ce fichier est INDÉPENDANT de model.py : il ne modifie rien. Il sert à décider
-si ECOD/COPOD valent mieux qu'Isolation Forest AVANT toute intégration.
+Ce fichier est INDÉPENDANT de model.py : il ne modifie rien.
 
 Usage :
     python pyod_detectors.py
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
 from pyod.models.copod import COPOD
 from pyod.models.ecod import ECOD
@@ -89,7 +91,14 @@ def compare(df: pd.DataFrame, n_repeats: int = N_REPEATS) -> pd.DataFrame:
     test_base = df.iloc[cut:].reset_index(drop=True)
 
     med = train_base[KPI].median()
-    x_train = train_base[KPI].fillna(med)
+    # Même préparation que model.py : log puis mise à l'échelle de l'entraînement.
+    # Sans elle, la latence (en milliers de ms) écrase les débits pour LOF.
+    scaler = StandardScaler().fit(np.log1p(train_base[KPI].fillna(med).clip(lower=0)))
+
+    def prepare(frame: pd.DataFrame) -> np.ndarray:
+        return scaler.transform(np.log1p(frame[KPI].fillna(med).clip(lower=0)))
+
+    x_train = prepare(train_base)
 
     rng = np.random.default_rng(SEED)
     # On fige les mêmes jeux de test injectés pour tous les détecteurs (équité).
@@ -100,7 +109,7 @@ def compare(df: pd.DataFrame, n_repeats: int = N_REPEATS) -> pd.DataFrame:
         model.fit(x_train)
         ys, scores = [], []
         for test_df, y in injected:
-            s = anomaly_scores(model, test_df[KPI].fillna(med))
+            s = anomaly_scores(model, prepare(test_df))
             ys.append(y)
             scores.append(s)
         y = np.concatenate(ys)
@@ -131,19 +140,16 @@ def compare(df: pd.DataFrame, n_repeats: int = N_REPEATS) -> pd.DataFrame:
 
 
 def main() -> None:
-    df = pd.read_csv(DATASET, parse_dates=["timestamp"])
+    df = pd.read_csv(DATASET)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="mixed")
     print(f"Dataset : {len(df)} mesures · KPI : {KPI}")
     print(f"Réf. hasard PR-AUC ≈ {INJECTION_RATE:.3f} (taux d'anomalies injectées)\n")
     table = compare(df)
     print(table.to_string(index=False))
     best = table.iloc[0]["Détecteur"]
-    iso = table[table["Détecteur"] == "Isolation Forest"].iloc[0]
     print(f"\nMeilleur ROC-AUC : {best}")
-    if best != "Isolation Forest":
-        gain = table.iloc[0]["ROC-AUC"] - iso["ROC-AUC"]
-        print(f"-> {best} dépasse Isolation Forest de {gain:+.3f} en ROC-AUC.")
-    else:
-        print("-> Isolation Forest reste le meilleur ici (ne pas changer).")
+    if best != "LOF":
+        print("-> LOF n'est plus le meilleur : revoir le choix de model.py.")
     print("\n⚠️  Anomalies fabriquées : scores = borne supérieure optimiste.")
 
 

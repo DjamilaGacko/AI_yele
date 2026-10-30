@@ -1,8 +1,8 @@
 """Étape 2 (nettoyage) : préparation des mesures Yélé pour l'IA.
 
-Lit l'export Compass local (yele_speedtest.speedtest_results.json ou
-raw.json) s'il existe, sinon interroge MongoDB directement. Applique le
-nettoyage et produit `dataset_clean.csv`, prêt pour la modélisation.
+Lit l'export Compass local s'il existe (CSV en priorité, sinon JSON), sinon
+interroge MongoDB directement. Applique le nettoyage et produit
+`dataset_clean.csv`, prêt pour la modélisation.
 
 Chaque transformation est journalisée pour comprendre ce qui est fait :
   1. conversion des types (Compass $date, débits texte -> nombres)
@@ -24,7 +24,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-LOCAL_FILES = ["yele_speedtest.speedtest_results.json", "raw.json"]
+# Le premier fichier présent est utilisé : le CSV est l'export Compass le plus
+# récent, le JSON l'ancien format.
+LOCAL_FILES = ["yele_speedtest.speedtest_results.csv",
+               "yele_speedtest.speedtest_results.json", "raw.json"]
+TEXT_COLUMNS = ["operator", "network_type", "device_model", "location",
+                "city", "country", "isp_info", "extra_raw"]
 OUTPUT = "dataset_clean.csv"
 NUMERIC = ["dl", "ul", "ping", "jitter"]
 # Champs personnels : jamais conservés dans le dataset final.
@@ -50,6 +55,17 @@ def _flatten_extended_json(value):
 
 def load_raw() -> pd.DataFrame:
     for name in LOCAL_FILES:
+        if os.path.exists(name) and name.endswith(".csv"):
+            df = pd.read_csv(name, low_memory=False)
+            # Compass laisse les champs vides en NaN ; le nettoyage attend "".
+            for col in df.columns:
+                if df[col].dtype == object:
+                    df[col] = df[col].fillna("")
+            for col in TEXT_COLUMNS:
+                df[col] = (df[col].fillna("").astype(str)
+                           if col in df.columns else "")
+            print(f"[chargement] {len(df)} mesures depuis {name}")
+            return df
         if os.path.exists(name):
             with open(name, encoding="utf-8") as f:
                 docs = json.load(f)
